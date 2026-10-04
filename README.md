@@ -47,6 +47,10 @@ search and replication in docker.
 * RAM: 16 GB (or 4 without indexed search)
 * Disk Space: 350 GB (or 100 without indexed search)
 
+To serve only the web service API (`/ws/2/`) to other applications
+from a small host such as a mini PC (8–16 GB RAM), see
+[Mini PC setup](docs/mini-pc.md).
+
 ### Required software
 
 * Docker Compose 2 (or higher), see [how to install Docker Compose](https://docs.docker.com/compose/install/)
