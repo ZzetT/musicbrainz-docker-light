@@ -362,6 +362,8 @@ ENTITIES = {
     'artist': {
         'table': 'artist', 'plural': 'artists', 'inc': 'aliases+tags',
         'credit': False,
+        'popularity': ('(SELECT coalesce(sum(pac.ref_count), 0) FROM artist_credit_name pacn'
+                       ' JOIN artist_credit pac ON pac.id = pacn.artist_credit WHERE pacn.artist = e.id)'),
         'fields': {
             'artist': name_set('artist'),
             'artistaccent': name_set('artist'),
@@ -379,6 +381,7 @@ ENTITIES = {
     'label': {
         'table': 'label', 'plural': 'labels', 'inc': 'aliases+tags',
         'credit': False,
+        'popularity': '(SELECT count(*) FROM release_label prl WHERE prl.label = e.id)',
         'fields': {
             'label': name_set('label'),
             'labelaccent': name_set('label'),
@@ -394,6 +397,7 @@ ENTITIES = {
     'series': {
         'table': 'series', 'plural': 'series', 'inc': 'aliases+tags',
         'credit': False,
+        'popularity': '0',
         'fields': {
             'series': name_set('series'),
             'seriesaccent': name_set('series'),
@@ -410,6 +414,7 @@ ENTITIES = {
         'table': 'release', 'plural': 'releases',
         'inc': 'artist-credits+labels+release-groups+media+tags',
         'credit': True,
+        'popularity': '(SELECT count(*) FROM release pr WHERE pr.release_group = e.release_group)',
         'fields': {
             'release': name_set('release'),
             'releaseaccent': name_set('release'),
@@ -443,6 +448,7 @@ ENTITIES = {
         'table': 'release_group', 'plural': 'release-groups',
         'inc': 'artist-credits+releases+tags',
         'credit': True,
+        'popularity': '(SELECT count(*) FROM release pr WHERE pr.release_group = e.id)',
         'fields': {
             'releasegroup': name_set('release_group'),
             'releasegroupaccent': name_set('release_group'),
@@ -470,6 +476,7 @@ ENTITIES = {
         'table': 'recording', 'plural': 'recordings',
         'inc': 'artist-credits+releases+release-groups+media+isrcs+tags',
         'credit': True,
+        'popularity': '(SELECT count(*) FROM track pt WHERE pt.recording = e.id)',
         'fields': {
             'recording': name_set('recording'),
             'recordingaccent': name_set('recording'),
@@ -569,7 +576,14 @@ def rank_terms(spec, node, trgm):
     return ' + '.join(parts), params
 
 
-def build_search_sql(entity, query, trgm):
+def build_search_sql(entity, query, trgm, max_candidates=50000):
+    """Build the SQL that ranks matching entities.
+
+    At most `max_candidates` matches are ranked, to bound the time spent on
+    very broad queries; the reported count is capped accordingly. Ties in
+    rank are broken by how often the entity is used (credits, releases or
+    tracks), as a stand-in for popularity.
+    """
     spec = ENTITIES[entity]
     node = parse_query(query)
     candidates_sql, candidates_params = compile_node(spec, node)
@@ -577,12 +591,13 @@ def build_search_sql(entity, query, trgm):
     table = spec['table']
     join_credit = ' JOIN artist_credit ac ON ac.id = e.artist_credit' if spec['credit'] else ''
     sql = (
-        f'WITH candidates AS (SELECT DISTINCT id FROM ({candidates_sql}) matches)'
+        f'WITH candidates AS (SELECT DISTINCT id FROM ({candidates_sql}) matches LIMIT %s)'
         ' SELECT gid, rank, count(*) OVER () AS total, max(rank) OVER () AS top'
-        f' FROM (SELECT e.gid::text AS gid, e.name, e.id, {rank_sql} AS rank'
+        f' FROM (SELECT e.gid::text AS gid, e.name, e.id, {rank_sql} AS rank,'
+        f' {spec["popularity"]} AS popularity'
         f' FROM {table} e JOIN candidates c ON c.id = e.id{join_credit}) ranked'
-        ' ORDER BY rank DESC, name, id LIMIT %s OFFSET %s')
-    return sql, candidates_params + rank_params
+        ' ORDER BY rank DESC, popularity DESC, name, id LIMIT %s OFFSET %s')
+    return sql, candidates_params + [max_candidates] + rank_params
 
 
 ################################################################################
@@ -660,13 +675,14 @@ def shape(entity, item, score):
 
 
 class SearchService:
-    def __init__(self, database, lookups):
+    def __init__(self, database, lookups, max_candidates):
         self.database = database
         self.lookups = lookups
+        self.max_candidates = max_candidates
 
     def search(self, entity, query, limit, offset):
         spec = ENTITIES[entity]
-        sql, params = build_search_sql(entity, query, self.database.trgm)
+        sql, params = build_search_sql(entity, query, self.database.trgm, self.max_candidates)
         try:
             rows = self.database.query(sql, params + [limit, offset])
         except self.database.psycopg.errors.QueryCanceled as error:
@@ -788,7 +804,8 @@ def main():
         workers=int(os.environ.get('PGSEARCH_LOOKUP_WORKERS', '4')),
         user_agent='musicbrainz-docker-light-pgsearch/1.0')
 
-    Handler.service = SearchService(database, lookups)
+    Handler.service = SearchService(
+        database, lookups, max_candidates=int(os.environ.get('PGSEARCH_MAX_CANDIDATES', '50000')))
     port = int(os.environ.get('PGSEARCH_PORT', '8000'))
     server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
     server.daemon_threads = True

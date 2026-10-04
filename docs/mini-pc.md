@@ -147,6 +147,56 @@ MB_SEARCH_CORES="artist label release release-group series"
 Then apply with `docker compose up -d`. If `recording` was loaded before,
 drop its index with `docker compose exec search delete-indexed-documents recording`.
 
+## Lightest: no Solr, search in Postgres
+
+The `mini-pc-pgsearch` profile drops Solr entirely. Searches are answered
+by `pgsearch`, a small service (about 30 MB of RAM) that queries the
+full-text indexes the MusicBrainz database already has, the same ones the
+website's "direct database search" uses. It needs no extra disk and no
+index refresh, and its results always match the replicated data.
+
+```bash
+admin/configure with default mini-pc mini-pc-pgsearch
+docker compose build
+docker compose up -d
+```
+
+Skip `refresh-search-cores`; if Solr indexes were loaded before, free their
+space with `docker volume rm musicbrainz-docker-light_solrdata
+musicbrainz-docker-light_solrdump` once Solr is stopped.
+
+How it works:
+
+* It understands the part of the Lucene syntax that DroppedNeedle and
+  SoulSync send: fields (`artist`, `release`, `releasegroup`, `recording`,
+  `label`, `alias`, `tag`, `arid`, `reid`, `rgid`, `isrc`, `barcode`,
+  `status`, `primarytype`, …), phrases, plain words, trailing wildcards,
+  `AND`/`OR`/`NOT`, `+`/`-`, parentheses and boosts (ignored).
+* It ranks matches by exact name match, then name similarity
+  (`pg_trgm`, enabled automatically), then credited artist similarity,
+  then popularity (credits, releases or tracks); the best match scores 100.
+* It fetches each result from the local web service, so results have the
+  usual JSON shape plus `score`.
+* JSON only. XML requests, unsupported fields (such as `date:` or ranges)
+  and queries slower than `PGSEARCH_STATEMENT_TIMEOUT_MS` are forwarded to
+  musicbrainz.org by the gateway, or answered with 503 when
+  `MB_UPSTREAM_HOST` is empty.
+
+Trade-offs compared to Solr:
+
+* No fuzzy matching: a typo finds nothing, while Solr would still match.
+  All the words of a plain-text query must match (Solr requires only some).
+* Simpler ranking, so the order of equally named results differs.
+* Broad queries are slower: at most `PGSEARCH_MAX_CANDIDATES` matches are
+  ranked, so a one-word search over all recordings ranks a subset.
+  Queries that combine a title with an artist, as both apps send, stay fast.
+
+Measured on a test database with 600,000 recordings, 200,000 releases
+and 50,000 artists (synthetic data), typical app queries took 0.05–0.15 s,
+and broad ones (a 2,000-way title, a one-word recording search with 18,000
+matches) 0.5–0.9 s. The real database has about 60 times more recordings, so
+broad recording searches will be slower; this has not been measured yet.
+
 ## Tuning
 
 All the settings below go in `.env`, then `docker compose up -d`:
@@ -163,6 +213,9 @@ All the settings below go in `.env`, then `docker compose up -d`:
 | `MB_UPSTREAM_HOST` | `musicbrainz.org` | Empty to never forward requests |
 | `MB_UPSTREAM_RATE` | `1r/s` | Keep within the [MusicBrainz rate limit](https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting) |
 | `VALKEY_MAXMEMORY` | `256mb` | |
+| `PGSEARCH_STATEMENT_TIMEOUT_MS` | `15000` | `mini-pc-pgsearch` only: slower searches are forwarded |
+| `PGSEARCH_MAX_CANDIDATES` | `50000` | `mini-pc-pgsearch` only: matches ranked per search |
+| `PGSEARCH_LOOKUP_WORKERS` | `4` | `mini-pc-pgsearch` only: parallel lookups per search |
 
 To build the search indexes from the database instead of downloading them,
 start the indexer with `docker compose --profile indexer up -d indexer`;
