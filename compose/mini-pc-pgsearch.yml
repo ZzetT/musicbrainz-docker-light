@@ -1,0 +1,38 @@
+# Description: Replace Solr with Postgres full-text search (with mini-pc)
+
+services:
+  musicbrainz:
+    depends_on: !override
+      - db
+      - valkey
+
+  # Solr is not needed; enable with `docker compose --profile solr up -d search`
+  search:
+    profiles:
+      - solr
+
+  pgsearch:
+    build: build/pgsearch
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
+    restart: unless-stopped
+    env_file:
+      - ./default/postgres.env
+    environment:
+      - PGSEARCH_CONNECTIONS=${PGSEARCH_CONNECTIONS:-4}
+      - PGSEARCH_LOOKUP_WORKERS=${PGSEARCH_LOOKUP_WORKERS:-4}
+      - PGSEARCH_STATEMENT_TIMEOUT_MS=${PGSEARCH_STATEMENT_TIMEOUT_MS:-15000}
+    expose:
+      - "8000"
+    depends_on:
+      - db
+      - musicbrainz
+
+  gateway:
+    environment:
+      - MB_SEARCH_BACKEND=postgres
+    depends_on:
+      - pgsearch

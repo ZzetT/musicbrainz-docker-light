@@ -3,11 +3,15 @@
 # Generate the nginx configuration of the MusicBrainz web service gateway.
 #
 # Requests are answered by the local mirror, except:
-# - search queries (`/ws/2/<entity>?query=...`) for entities whose Solr
-#   collection is not listed in MB_SEARCH_CORES,
+# - search queries (`/ws/2/<entity>?query=...`) for entities not listed
+#   in MB_SEARCH_CORES,
 # - requests that need a MusicBrainz account (collections, any non-GET),
 # which are forwarded to MB_UPSTREAM_HOST (rate limited) when it is set,
 # or answered with 503 otherwise.
+#
+# With MB_SEARCH_BACKEND=postgres, local search queries go to the pgsearch
+# service instead of MusicBrainz Server (Solr), and the queries pgsearch
+# cannot answer (status 501 or 504) are forwarded like above.
 
 set -e -u
 
@@ -15,6 +19,17 @@ MB_SEARCH_CORES="${MB_SEARCH_CORES:-artist label recording release release-group
 MB_UPSTREAM_HOST="${MB_UPSTREAM_HOST-musicbrainz.org}"
 MB_UPSTREAM_RATE="${MB_UPSTREAM_RATE:-1r/s}"
 MB_LOCAL_SERVER="${MB_LOCAL_SERVER:-musicbrainz:5000}"
+MB_SEARCH_BACKEND="${MB_SEARCH_BACKEND:-solr}"
+MB_PGSEARCH_SERVER="${MB_PGSEARCH_SERVER:-pgsearch:8000}"
+
+case "$MB_SEARCH_BACKEND" in
+  solr) search_route=local;;
+  postgres) search_route=pgsearch;;
+  *)
+    echo >&2 "$0: MB_SEARCH_BACKEND must be 'solr' or 'postgres'"
+    exit 1
+    ;;
+esac
 
 local_cores=$(echo "$MB_SEARCH_CORES" | tr ', ' '\n' | grep -v '^$' | paste -s -d '|' -)
 if [ -z "$local_cores" ]
@@ -53,7 +68,7 @@ map \$arg_query \$mb_is_search {
 }
 
 map "\$mb_is_search:\$mb_entity" \$mb_search_route {
-    "~^1:($local_cores)\$" local;
+    "~^1:($local_cores)\$" $search_route;
     "~^1:" upstream;
     default local;
 }
@@ -66,6 +81,7 @@ map "\$request_method:\$uri" \$mb_method_route {
 
 map "\$mb_method_route:\$mb_search_route" \$mb_route {
     "local:local" local;
+    "local:pgsearch" pgsearch;
     default upstream;
 }
 
@@ -83,10 +99,16 @@ server {
         return 200 "ok\n";
     }
 
+    recursive_error_pages on;
+
     location /ws/2/ {
         error_page 418 = @upstream;
         if (\$mb_route = upstream) {
             return 418;
+        }
+        error_page 419 = @pgsearch;
+        if (\$mb_route = pgsearch) {
+            return 419;
         }
 
         set \$mb_local_server $MB_LOCAL_SERVER;
@@ -94,6 +116,14 @@ server {
         proxy_set_header Host \$http_host;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_read_timeout 120s;
+    }
+
+    location @pgsearch {
+        set \$mb_pgsearch_server $MB_PGSEARCH_SERVER;
+        proxy_pass http://\$mb_pgsearch_server;
+        proxy_read_timeout 120s;
+        proxy_intercept_errors on;
+        error_page 501 504 = @upstream;
     }
 
     location @upstream {
@@ -107,4 +137,4 @@ server {
 }
 EOF
 
-echo "$0: local search cores: $local_cores; upstream: ${MB_UPSTREAM_HOST:-(disabled)}"
+echo "$0: local search ($MB_SEARCH_BACKEND): $local_cores; upstream: ${MB_UPSTREAM_HOST:-(disabled)}"
