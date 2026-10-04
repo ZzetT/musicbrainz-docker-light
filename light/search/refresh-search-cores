@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+
+# Fetch and load only the MusicBrainz Solr collections listed in
+# MB_SEARCH_CORES, one at a time, removing each archive once loaded,
+# so that disk usage peaks at a single collection.
+#
+# Runs inside the `search` service container:
+#   docker compose exec search refresh-search-cores
+
+set -e -o pipefail -u
+
+BASE_DOWNLOAD_URL="${MUSICBRAINZ_BASE_DOWNLOAD_URL:-https://data.metabrainz.org/pub/musicbrainz}"
+MB_SEARCH_CORES="${MB_SEARCH_CORES:-artist label recording release release-group series}"
+WORK_DIR="${MB_SEARCH_WORK_DIR:-/var/cache/musicbrainz/solr-backups/light}"
+
+SCRIPT_NAME=$(basename "$0")
+HELP=$(cat <<EOH
+Usage: $SCRIPT_NAME [<collection>...]
+
+Fetch the latest backup archives of the given MusicBrainz Solr collections
+(default from MB_SEARCH_CORES: $MB_SEARCH_CORES)
+and load them one at a time, deleting each archive once loaded.
+
+Environment:
+  MB_SEARCH_CORES               Space-separated list of collections
+  MUSICBRAINZ_BASE_DOWNLOAD_URL MetaBrainz download server
+                                (default: $BASE_DOWNLOAD_URL)
+EOH
+)
+
+if [[ $# -gt 0 && $1 =~ ^-*h(elp)?$ ]]
+then
+  echo "$HELP"
+  exit 0
+fi
+
+if [[ $# -gt 0 ]]
+then
+  cores=("$@")
+else
+  read -r -a cores <<< "${MB_SEARCH_CORES//,/ }"
+fi
+
+cat <<EOM
+The data you are about to download is provided by the MetaBrainz Foundation.
+Please sign up at https://metabrainz.org/supporters/account-type (free for
+non-commercial use); commercial users are required to support MetaBrainz.
+
+EOM
+
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR"
+find . -mindepth 1 -delete
+
+wget -q -nd -nH "$BASE_DOWNLOAD_URL/data/solr-backups/LATEST"
+DUMP_TIMESTAMP=$(<LATEST)
+DUMP_URL="$BASE_DOWNLOAD_URL/data/solr-backups/$DUMP_TIMESTAMP"
+wget -q -nd -nH "$DUMP_URL/MD5SUMS"
+echo "$(date): Using search index backups from $DUMP_TIMESTAMP"
+
+for core in "${cores[@]}"
+do
+  echo "$(date): Fetching collection '$core'..."
+  wget -nv -nd -nH -c "$DUMP_URL/$core.tar.zst"
+  grep -E "[ *]$core\.tar\.zst$" MD5SUMS | md5sum -c -
+
+  MUSICBRAINZ_SEARCH_DUMP_DIR="$WORK_DIR" load-backup-archives
+  rm -f "$core.tar.zst"
+done
+
+find . -mindepth 1 -delete
+echo "$(date): Done loading search collections: ${cores[*]}"

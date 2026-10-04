@@ -1,0 +1,79 @@
+# Description: Slim web service API only setup for small hosts (mini PC)
+
+services:
+  db:
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-2GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-8MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-50}
+      - -c
+      - max_parallel_workers_per_gather=1
+      - -c
+      - jit=off
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+    shm_size: "256MB"
+
+  musicbrainz:
+    command: ["bash", "/usr/local/bin/start-api-only.sh"]
+    environment:
+      - MUSICBRAINZ_SERVER_PROCESSES=${MUSICBRAINZ_SERVER_PROCESSES:-3}
+    volumes:
+      - ./light/musicbrainz/start-api-only.sh:/usr/local/bin/start-api-only.sh:ro
+    ports: !reset []
+    expose:
+      - "5000"
+
+  # Only needed to build search indexes from the database or for live
+  # indexing; enable with `docker compose --profile indexer up -d indexer`.
+  indexer:
+    profiles:
+      - indexer
+
+  search:
+    environment:
+      - SOLR_HEAP=${SOLR_HEAP:-1g}
+      - MB_SEARCH_CORES=${MB_SEARCH_CORES:-artist label recording release release-group series}
+    volumes:
+      - ./light/search/refresh-search-cores:/usr/local/bin/refresh-search-cores:ro
+
+  valkey:
+    command:
+      - valkey-server
+      - --maxmemory
+      - ${VALKEY_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+
+  gateway:
+    image: nginx:1.29-alpine
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "10"
+    restart: unless-stopped
+    ports:
+      - "${MUSICBRAINZ_DOCKER_HOST_IPADDRCOL:-}${MUSICBRAINZ_WEB_SERVER_PORT:-5000}:80"
+    environment:
+      - MB_SEARCH_CORES=${MB_SEARCH_CORES:-artist label recording release release-group series}
+      - MB_UPSTREAM_HOST=${MB_UPSTREAM_HOST-musicbrainz.org}
+      - MB_UPSTREAM_RATE=${MB_UPSTREAM_RATE:-1r/s}
+    volumes:
+      - ./light/gateway/40-musicbrainz-gateway.sh:/docker-entrypoint.d/40-musicbrainz-gateway.sh:ro
+    depends_on:
+      - musicbrainz
